@@ -1,0 +1,518 @@
+/**
+ * @file civ_handler.cpp
+ * @brief CI-V Protocol Handler Implementation for ShackMate Power Outlet
+ *
+ * Implementation of CI-V protocol handling including message parsing,
+ * validation, command processing, and rate limiting for heavy traffic scenarios.
+ *
+ * @author ShackMate Project
+ * @version 1.0.0
+ */
+
+#include "civ_handler.h"
+#include "rate_limiter.h"
+#include "network_manager.h"
+#include "hardware_controller.h"
+#include "device_state.h"
+#include "event_manager.h"
+#include "logger.h"
+
+// Global CI-V handler instance
+CivHandler civHandler;
+
+// External references (these will be available from main.cpp context)
+extern HardwareController hardware;
+extern bool relay1State, relay2State;
+extern void syncRelayStatesWithDeviceState();
+extern void triggerRelayStateChangeEvent();
+
+CivHandler::CivHandler(DebugCallback debugCallback)
+    : m_deviceId(1), m_civAddress(0xB0), m_messageCount(0), m_relay1State(false), m_relay2State(false), m_debugCallback(debugCallback), m_lastProcessDebugTime(0), m_lastCivDebugTime(0), m_lastRateLimitLog(0)
+{
+}
+
+void CivHandler::setDebugCallback(DebugCallback debugCallback)
+{
+    m_debugCallback = debugCallback;
+}
+
+void CivHandler::init(uint8_t deviceId)
+{
+    m_deviceId = deviceId;
+    m_civAddress = 0xB0 + (deviceId - 1); // Base address 0xB0, offset by device ID
+
+    LOG_INFO("CI-V Handler initialized:");
+    LOG_INFO("  Device ID: " + String(m_deviceId));
+    LOG_INFO("  CI-V Address: 0x" + String(m_civAddress, HEX));
+    LOG_INFO("  Broadcast Filtering: " + String(CIV_ENABLE_BROADCAST_FILTERING ? "ENABLED" : "DISABLED"));
+
+    if (CIV_ENABLE_BROADCAST_FILTERING)
+    {
+        LOG_INFO("  Allowed Broadcast Source: 0x" + String(CIV_ALLOWED_BROADCAST_SOURCE, HEX));
+    }
+}
+
+uint8_t CivHandler::getCivAddressByte() const
+{
+    return m_civAddress;
+}
+
+void CivHandler::setRelayStates(bool relay1, bool relay2)
+{
+    m_relay1State = relay1;
+    m_relay2State = relay2;
+}
+
+void CivHandler::getRelayStates(bool &relay1, bool &relay2) const
+{
+    relay1 = m_relay1State;
+    relay2 = m_relay2State;
+}
+
+uint32_t CivHandler::getMessageCount() const
+{
+    return m_messageCount;
+}
+
+bool CivHandler::hexStringToBytes(const String &hexStr, std::vector<uint8_t> &bytes)
+{
+    // Clean hex string - remove spaces and convert to uppercase
+    String cleanHex = hexStr;
+    cleanHex.replace(" ", "");
+    cleanHex.toUpperCase();
+
+    // Validate length
+    if (cleanHex.length() < 12 || cleanHex.length() % 2 != 0 || cleanHex.length() > 128)
+    {
+        sendDebugMessage("CI-V: Invalid message length: " + String(cleanHex.length()) + " (min: 12, max: 128)");
+        return false;
+    }
+
+    // Convert hex pairs to bytes
+    bytes.clear();
+    bytes.reserve(cleanHex.length() / 2);
+
+    for (unsigned int i = 0; i < cleanHex.length(); i += 2)
+    {
+        String byteStr = cleanHex.substring(i, i + 2);
+        uint8_t byte = (uint8_t)strtol(byteStr.c_str(), NULL, 16);
+        bytes.push_back(byte);
+    }
+
+    return true;
+}
+
+bool CivHandler::validateCivFormat(const std::vector<uint8_t> &bytes)
+{
+    // Check minimum length
+    if (bytes.size() < 6)
+    {
+        sendDebugMessage("CI-V: Message too short: " + String(bytes.size()) + " bytes");
+        return false;
+    }
+
+    // Check preamble (FE FE)
+    if (bytes[0] != 0xFE || bytes[1] != 0xFE)
+    {
+        sendDebugMessage("CI-V: Invalid preamble - expected FE FE, got " +
+                         String(bytes[0], HEX) + " " + String(bytes[1], HEX));
+        return false;
+    }
+
+    // Check terminator (FD)
+    if (bytes[bytes.size() - 1] != 0xFD)
+    {
+        String invalidHex = String(bytes[bytes.size() - 1], HEX);
+        invalidHex.toUpperCase();
+        if (invalidHex.length() == 1)
+            invalidHex = "0" + invalidHex;
+        sendDebugMessage("CI-V: Invalid terminator - expected FD, got " + invalidHex);
+        return false;
+    }
+
+    return true;
+}
+
+void CivHandler::extractMessageComponents(const std::vector<uint8_t> &bytes, CivMessage &msg)
+{
+    // Extract basic components
+    msg.toAddr = bytes[2];
+    msg.fromAddr = bytes[3];
+    msg.command = bytes[4];
+
+    // Handle command-specific parsing
+    if (msg.command == 0x35) // Outlet control command
+    {
+        msg.subCommand = 0x00; // No subcommand for command 35
+
+        // Extract data portion (after command, before terminator)
+        if (bytes.size() > 6)
+        {
+            for (size_t i = 5; i < bytes.size() - 1 && msg.data.size() < 16; i++)
+            {
+                msg.data.push_back(bytes[i]);
+            }
+        }
+    }
+    else
+    {
+        // Standard format: FE FE TO FROM CMD [SUB] [DATA...] FD
+        if (bytes.size() == 6)
+        {
+            // Basic command, no subcommand
+            msg.subCommand = 0x00;
+        }
+        else if (bytes.size() >= 7)
+        {
+            // Command with subcommand and optional data
+            msg.subCommand = bytes[5];
+
+            // Extract data portion (after subcommand, before terminator)
+            if (bytes.size() > 7)
+            {
+                for (size_t i = 6; i < bytes.size() - 1 && msg.data.size() < 16; i++)
+                {
+                    msg.data.push_back(bytes[i]);
+                }
+            }
+        }
+    }
+
+    msg.valid = true;
+
+    // Debug output
+    char debugBuffer[128];
+    snprintf(debugBuffer, sizeof(debugBuffer),
+             "CI-V: Parsed - TO:%02X FROM:%02X CMD:%02X SUB:%02X",
+             msg.toAddr, msg.fromAddr, msg.command, msg.subCommand);
+    sendDebugMessage(String(debugBuffer));
+}
+
+CivMessage CivHandler::parseCivMessage(const String &hexMsg)
+{
+    CivMessage msg = {false, 0, 0, 0, 0, {}};
+
+    sendDebugMessage("CI-V: Parsing message: '" + hexMsg + "'");
+
+    // Convert hex string to bytes
+    std::vector<uint8_t> bytes;
+    if (!hexStringToBytes(hexMsg, bytes))
+    {
+        return msg; // Invalid format
+    }
+
+    sendDebugMessage("CI-V: Clean hex processed, " + String(bytes.size()) + " bytes");
+
+    // Validate CI-V message format
+    if (!validateCivFormat(bytes))
+    {
+        return msg; // Invalid format
+    }
+
+    // Extract message components
+    extractMessageComponents(bytes, msg);
+
+    return msg;
+}
+
+bool CivHandler::isBroadcastAllowed(const CivMessage &msg)
+{
+    if (CIV_ENABLE_BROADCAST_FILTERING)
+    {
+        // Only accept broadcast messages FROM the allowed source address
+        if (msg.fromAddr == CIV_ALLOWED_BROADCAST_SOURCE)
+        {
+            sendDebugMessage("CI-V: Broadcast message ACCEPTED - FROM 0x" +
+                             String(CIV_ALLOWED_BROADCAST_SOURCE, HEX) + " to broadcast (0x00)");
+            return true;
+        }
+        else
+        {
+            sendDebugMessage("CI-V: Broadcast message REJECTED - FROM 0x" + String(msg.fromAddr, HEX) +
+                             " (not allowed source 0x" + String(CIV_ALLOWED_BROADCAST_SOURCE, HEX) + ")");
+            return false;
+        }
+    }
+    else
+    {
+        // Broadcast filtering disabled - accept all broadcast messages
+        sendDebugMessage("CI-V: Broadcast message ACCEPTED - filtering disabled, FROM: 0x" +
+                         String(msg.fromAddr, HEX));
+        return true;
+    }
+}
+
+bool CivHandler::isCivMessageForUs(const CivMessage &msg)
+{
+    bool isBroadcast = (msg.toAddr == 0x00);
+    bool isAddressedToUs = (msg.toAddr == m_civAddress);
+
+    // Enhanced debug for broadcast messages
+    if (isBroadcast)
+    {
+        sendDebugMessage("*** BROADCAST MESSAGE ANALYSIS ***");
+        sendDebugMessage("TO: 0x00 (broadcast), FROM: 0x" + String(msg.fromAddr, HEX) +
+                         ", CMD: 0x" + String(msg.command, HEX) + ", SUB: 0x" + String(msg.subCommand, HEX));
+        sendDebugMessage("Our address: 0x" + String(m_civAddress, HEX) +
+                         ", Broadcast filtering: " + String(CIV_ENABLE_BROADCAST_FILTERING ? "ENABLED" : "DISABLED"));
+    }
+
+    // CI-V address filtering logic
+    if (isBroadcast)
+    {
+        return isBroadcastAllowed(msg);
+    }
+    else if (isAddressedToUs)
+    {
+        // Direct message to our address - always accept
+        sendDebugMessage("CI-V: Direct message ACCEPTED - TO our address 0x" + String(m_civAddress, HEX) +
+                         ", FROM: 0x" + String(msg.fromAddr, HEX));
+        return true;
+    }
+    else
+    {
+        // Message not for us
+        sendDebugMessage("CI-V: Message REJECTED - TO: 0x" + String(msg.toAddr, HEX) +
+                         " (not our address 0x" + String(m_civAddress, HEX) + ")");
+        return false;
+    }
+}
+
+String CivHandler::generateResponse(uint8_t toAddr, uint8_t command, uint8_t subCommand,
+                                    const std::vector<uint8_t> &data)
+{
+    String response = "FE FE " + String(toAddr, HEX) + " " + String(m_civAddress, HEX) +
+                      " " + String(command, HEX);
+
+    if (command != 0x35 && subCommand != 0x00) // Add subcommand if not outlet control
+    {
+        response += " " + String(subCommand, HEX);
+    }
+
+    // Add data bytes
+    for (uint8_t byte : data)
+    {
+        response += " " + String(byte, HEX);
+    }
+
+    response += " FD";
+    response.toUpperCase();
+
+    return response;
+}
+
+String CivHandler::handleEchoRequest(uint8_t fromAddr)
+{
+    return generateResponse(fromAddr, 0x19, 0x00, {m_civAddress});
+}
+
+String CivHandler::handleModelIdRequest(uint8_t fromAddr)
+{
+    IPAddress ip = WiFi.localIP();
+    std::vector<uint8_t> ipData = {
+        (uint8_t)ip[0], (uint8_t)ip[1], (uint8_t)ip[2], (uint8_t)ip[3]};
+    return generateResponse(fromAddr, 0x19, 0x01, ipData);
+}
+
+String CivHandler::handleReadModel(uint8_t fromAddr)
+{
+    return generateResponse(fromAddr, 0x34, 0x00, {0x01}); // Model 01 = Wyze Outdoor Power Outlet
+}
+
+String CivHandler::handleOutletControl(uint8_t fromAddr, const std::vector<uint8_t> &data)
+{
+    if (data.size() == 0) // Read status
+    {
+        uint8_t status = (m_relay2State ? 0x02 : 0x00) | (m_relay1State ? 0x01 : 0x00);
+        return generateResponse(fromAddr, 0x35, 0x00, {status});
+    }
+    else if (data.size() == 1) // Set status
+    {
+        uint8_t newStatus = data[0];
+        bool newRelay1 = (newStatus & 0x01) != 0;
+        bool newRelay2 = (newStatus & 0x02) != 0;
+
+        // Update relay states if changed
+        if (newRelay1 != relay1State || newRelay2 != relay2State)
+        {
+            // Update global relay states (external variables)
+            relay1State = newRelay1;
+            relay2State = newRelay2;
+
+            // Update internal states
+            m_relay1State = newRelay1;
+            m_relay2State = newRelay2;
+
+            // Control hardware relays
+            hardware.setRelay(1, relay1State);
+            hardware.setRelay(2, relay2State);
+
+            // Sync with device state and trigger events
+            syncRelayStatesWithDeviceState();
+            triggerRelayStateChangeEvent();
+
+            // Performance optimization: Only log during verbose periods
+            unsigned long currentTime = millis();
+            if (currentTime - m_lastProcessDebugTime > 3000)
+            {
+                sendDebugMessage("CI-V: Outlets changed - 1:" + String(relay1State ? "ON" : "OFF") +
+                                 " 2:" + String(relay2State ? "ON" : "OFF"));
+            }
+        }
+
+        // Echo back the status
+        return generateResponse(fromAddr, 0x35, 0x00, {newStatus});
+    }
+
+    return ""; // Invalid data size
+}
+
+bool CivHandler::processCivMessage(const CivMessage &msg)
+{
+    // Performance optimization: Reduce verbose logging during heavy traffic
+    unsigned long currentTime = millis();
+    bool verboseLogging = (currentTime - m_lastProcessDebugTime > 3000); // Every 3 seconds
+
+    if (verboseLogging)
+    {
+        String commandSummary = "CI-V Processing: ";
+        if (msg.command == 0x19 && msg.subCommand == 0x00)
+            commandSummary += "Echo Request";
+        else if (msg.command == 0x19 && msg.subCommand == 0x01)
+            commandSummary += "Model ID Request";
+        else if (msg.command == 0x34)
+            commandSummary += "Read Model";
+        else if (msg.command == 0x35)
+            commandSummary += (msg.data.size() == 0) ? "Read Outlet Status" : "Set Outlet Status";
+        else
+            commandSummary += "Command 0x" + String(msg.command, HEX);
+
+        sendDebugMessage(commandSummary);
+        m_lastProcessDebugTime = currentTime;
+    }
+
+    // Process commands
+    String response = "";
+    bool handled = false;
+
+    if (msg.command == 0x19) // Echo/Model commands
+    {
+        if (msg.subCommand == 0x00) // Echo request
+        {
+            response = handleEchoRequest(msg.fromAddr);
+            handled = true;
+        }
+        else if (msg.subCommand == 0x01) // Model ID request
+        {
+            response = handleModelIdRequest(msg.fromAddr);
+            handled = true;
+        }
+    }
+    else if (msg.command == 0x34) // Read model
+    {
+        response = handleReadModel(msg.fromAddr);
+        handled = true;
+    }
+    else if (msg.command == 0x35) // Outlet control
+    {
+        response = handleOutletControl(msg.fromAddr, msg.data);
+        handled = !response.isEmpty();
+    }
+
+    // Send response if we have one
+    if (handled && !response.isEmpty() && NetworkManager::isClientConnected())
+    {
+        NetworkManager::sendToServer(response);
+
+        if (verboseLogging)
+        {
+            sendDebugMessage("CI-V Response: " + response);
+        }
+    }
+
+    return handled;
+}
+
+void CivHandler::handleReceivedCivMessage(const String &message)
+{
+    // Rate limiting to prevent ESP32 lockups during heavy CI-V traffic
+    static RateLimiter rateLimiter;
+
+    if (!rateLimiter.allowMessage())
+    {
+        // Log rate limiting periodically to avoid log spam
+        unsigned long currentTime = millis();
+        if (currentTime - m_lastRateLimitLog > 5000) // Every 5 seconds
+        {
+            sendDebugMessage("CI-V RATE LIMITED: Dropped " + String(rateLimiter.getDroppedCount()) +
+                             " messages. Current rate: " + String(rateLimiter.getCurrentRate()) + "/sec");
+            m_lastRateLimitLog = currentTime;
+        }
+        return; // Drop the message
+    }
+
+    // Performance optimization: Reduce debug output during heavy traffic
+    unsigned long currentTime = millis();
+    m_messageCount++;
+
+    // Only log detailed debug info every 5 seconds during heavy traffic
+    bool verboseLogging = (currentTime - m_lastCivDebugTime > 5000);
+
+    if (verboseLogging)
+    {
+        sendDebugMessage("=== CI-V MESSAGE RECEIVED (Count: " + String(m_messageCount) + ") ===");
+        sendDebugMessage("Raw message: '" + message + "' (length: " + String(message.length()) + ")");
+        sendDebugMessage("Our CI-V address: 0x" + String(m_civAddress, HEX));
+        m_lastCivDebugTime = currentTime;
+    }
+
+    // CRITICAL: Always show CI-V traffic on serial for monitoring
+    Serial.println("CI-V[" + String(m_messageCount) + "]: " + message);
+
+    // Quick validation - skip processing if message is too short or malformed
+    if (message.length() < 12 || message.indexOf("FE") == -1)
+    {
+        if (verboseLogging)
+            sendDebugMessage("Message too short or not CI-V format - ignoring");
+        return;
+    }
+
+    // Performance optimization: Parse with reduced overhead
+    CivMessage civMsg = parseCivMessage(message);
+
+    if (civMsg.valid && isCivMessageForUs(civMsg))
+    {
+        if (verboseLogging)
+        {
+            sendDebugMessage("CI-V addressed to us: TO=0x" + String(civMsg.toAddr, HEX) +
+                             " FROM=0x" + String(civMsg.fromAddr, HEX) +
+                             " CMD=0x" + String(civMsg.command, HEX));
+        }
+
+        // Process the CI-V message with optimized handling
+        processCivMessage(civMsg);
+    }
+    else if (verboseLogging)
+    {
+        sendDebugMessage("CI-V message not for us or invalid - ignoring");
+    }
+
+    // Yield processing to prevent blocking during heavy traffic
+    yield();
+}
+
+uint32_t CivHandler::getDroppedMessageCount() const
+{
+    // This would need access to the static RateLimiter instance
+    // For now, return 0 - could be improved with better architecture
+    return 0;
+}
+
+void CivHandler::sendDebugMessage(const String &message)
+{
+    // Use debug callback if available
+    if (m_debugCallback)
+    {
+        m_debugCallback(message);
+    }
+}
